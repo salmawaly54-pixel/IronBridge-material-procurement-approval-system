@@ -1,0 +1,162 @@
+"""
+Interactive IronBridge procurement agent.
+
+Unlike demo_scenario.py (a fixed script for repeatable grading), this
+is the genuine "someone types a request in plain English" agent: it
+discovers whatever tools/resources/prompts the MCP server currently
+exposes, hands them to Claude as real tool-use tools, and lets Claude
+decide which ones to call and with what arguments. Nothing here
+hard-codes which tool answers which question.
+
+Usage:
+    export ANTHROPIC_API_KEY=...
+    python3 agent/agent.py                       # stdio, spawns the server
+    python3 agent/agent.py --transport http --http-url http://localhost:8080/mcp --http-token secret
+
+Try, e.g.:
+    "What steel do we have in stock?"
+    "Submit a request for 15 units of steel (material 2) for project 2, I'm employee 7"
+    "Log me in as Sami with PIN 1108"                     -> triggers notifications
+    "Approve request <id>"                                -> triggers elicitation (real prompt!)
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+import mcp_client
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def mcp_tool_to_anthropic(tool) -> dict:
+    return {
+        "name": tool.name,
+        "description": tool.description or "",
+        "input_schema": tool.inputSchema,
+    }
+
+
+async def run_agent(transport: str, http_url: str | None, http_token: str | None):
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ANTHROPIC_API_KEY is not set -- the agent's own driving model "
+              "(the one deciding which tools to call) needs it. Sampling "
+              "requests FROM the server would also fail without it.")
+        return
+
+    import anthropic
+    claude = anthropic.Anthropic(api_key=api_key)
+
+    state = {"anthropic_tools": []}
+
+    async def refresh_tools_and_announce():
+        result = await SESSION.list_tools()
+        state["anthropic_tools"] = [mcp_tool_to_anthropic(t) for t in result.tools]
+        names = [t.name for t in result.tools]
+        print(f"\n[tool set updated] now available: {names}\n")
+
+    connect_kwargs = dict(
+        transport=transport,
+        auto_elicit_answers=None,  # genuine interactive elicitation -- real prompts
+        on_tools_changed=refresh_tools_and_announce,
+    )
+    if transport == "stdio":
+        connect_kwargs["server_command"] = [sys.executable, "mcp_server/server.py"]
+        connect_kwargs["server_cwd"] = REPO_ROOT
+    else:
+        connect_kwargs["http_url"] = http_url
+        connect_kwargs["http_token"] = http_token
+
+    async with mcp_client.connect(**connect_kwargs) as (session, init_result):
+        global SESSION
+        SESSION = session
+
+        # === CONCERN: Capability negotiation (client side) ===
+        print(f"Connected to {init_result.serverInfo.name} v{init_result.serverInfo.version}")
+        print(f"Server capabilities: {init_result.capabilities}")
+        supports_notifications = mcp_client.check_capability(init_result, "tools.listChanged")
+        print(f"Server advertises tools.listChanged: {supports_notifications}")
+        if not supports_notifications:
+            print("(No push support declared -- this agent would need to "
+                  "poll list_tools() periodically instead of trusting a "
+                  "notification that may never come. Not implemented here "
+                  "since IronBridge's server does declare it.)")
+
+        await refresh_tools_and_announce()
+
+        print(
+            "\nIronBridge Procurement Assistant -- type a request in plain "
+            "English, or 'quit' to exit.\n"
+        )
+
+        conversation: list[dict] = []
+
+        while True:
+            user_text = await asyncio.to_thread(input, "you> ")
+            if user_text.strip().lower() in ("quit", "exit"):
+                break
+
+            conversation.append({"role": "user", "content": user_text})
+
+            # Loop until Claude stops asking for tool calls.
+            while True:
+                response = claude.messages.create(
+                    model="claude-sonnet-4-5",
+                    max_tokens=1024,
+                    system=(
+                        "You are the IronBridge Construction procurement "
+                        "assistant. Use the available tools to answer "
+                        "questions and carry out requests. Only call tools "
+                        "that are currently offered to you -- if an action "
+                        "isn't available yet (e.g. approving a request), "
+                        "explain to the user what they need to do first "
+                        "(e.g. authenticate) rather than guessing."
+                    ),
+                    tools=state["anthropic_tools"],
+                    messages=conversation,
+                )
+
+                conversation.append({"role": "assistant", "content": response.content})
+
+                if response.stop_reason != "tool_use":
+                    for block in response.content:
+                        if block.type == "text":
+                            print(f"assistant> {block.text}")
+                    break
+
+                tool_results = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    print(f"  [calling tool] {block.name}({block.input})")
+                    result = await session.call_tool(block.name, block.input)
+                    text = "".join(c.text for c in result.content if hasattr(c, "text"))
+                    print(f"  [tool result] {text}")
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": text,
+                            "is_error": result.isError,
+                        }
+                    )
+                conversation.append({"role": "user", "content": tool_results})
+                # loop again so Claude can react to the tool result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--transport", choices=["stdio", "http"], default="stdio")
+    parser.add_argument("--http-url", default=os.environ.get("IRONBRIDGE_MCP_URL"))
+    parser.add_argument("--http-token", default=os.environ.get("IRONBRIDGE_API_TOKEN"))
+    args = parser.parse_args()
+    asyncio.run(run_agent(args.transport, args.http_url, args.http_token))
+
+
+if __name__ == "__main__":
+    main()
