@@ -12,6 +12,26 @@ build/
 develop-eggs/
 dist/
 downloads/
+# Secrets — never commit
+.env
+*.pem
+*.key
+
+# Local database
+db/*.db
+db/*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
 eggs/
 .eggs/
 lib/
