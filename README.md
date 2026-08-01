@@ -155,43 +155,6 @@ capability check.
 capability-aware client should fall back to returning the raw JSON
 records without the narrative summary.
 
-## Setup
-
-```bash
-pip install -r requirements.txt
-
-python3 -c "
-import sqlite3
-conn = sqlite3.connect('db/procurement.db')
-conn.executescript(open('db/schema.sql').read())
-conn.executescript(open('db/seed.sql').read())
-conn.commit()
-"
-
-# Full scripted demo — every concern, no interaction needed, no API key
-# required (uses a stand-in sampling_callback, see demo/transcript.md)
-python -m demo.run_demo
-
-# Interactive agent — wired to a REAL Claude model for sampling.
-# Requires ANTHROPIC_API_KEY (see .env.example).
-export ANTHROPIC_API_KEY=sk-ant-...
-python -m agent.client
-
-# Server standalone (stdio)
-python -m mcp_server.server
-
-# Server over Streamable HTTP
-TRANSPORT=http IRONBRIDGE_API_TOKEN=devtoken python -m mcp_server.server
-```
-
-Demo approver logins (see `db/seed.sql` for the full list):
-
-| Employee | Role | Project | PIN |
-|---|---|---|---|
-| Rania Adel | Project Manager | 1 | `5521` |
-| Omar Sherif | Finance Officer | cross-project | `3390` |
-| Dalia Hassan | Warehouse Supervisor | cross-project | `7744` |
-| Sami Ghanem | Project Manager | 2 | `1108` |
 
 ## What we'd still worry about in production
 
