@@ -143,24 +143,25 @@ async def run_agent(transport: str, http_url: str | None, http_token: str | None
                 message = response.choices[0].message
                 # Groq/OpenAI's assistant message must be echoed back verbatim
                 # (including tool_calls) for the follow-up call to make sense.
-                conversation.append(
-                    {
-                        "role": "assistant",
-                        "content": message.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": tc.type,
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
-                            }
-                            for tc in (message.tool_calls or [])
-                        ]
-                        or None,
-                    }
-                )
+                # IMPORTANT: the API rejects "tool_calls": null outright (it
+                # must be either a real list or the key must be absent) --
+                # this bit us on the second turn of a real conversation, once
+                # a previous plain-text reply (no tool calls) got sent back
+                # as part of the history.
+                assistant_msg = {"role": "assistant", "content": message.content}
+                if message.tool_calls:
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ]
+                conversation.append(assistant_msg)
 
                 if not message.tool_calls:
                     if message.content:
