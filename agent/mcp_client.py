@@ -20,7 +20,7 @@ side of the handshake:
     loop prompt: it inspects the server's requestedSchema and asks the
     person at the terminal, it does not auto-approve.
   * Sampling -- `make_sampling_callback` forwards the request to the
-    CLIENT's own model (a direct Anthropic API call from *this*
+    CLIENT's own model (a direct Groq API call from *this*
     process), never the server's model -- the server has no model of
     its own to fall back on.
 
@@ -116,22 +116,28 @@ def make_sampling_callback():
         context: RequestContext,
         params: types.CreateMessageRequestParams,
     ) -> types.CreateMessageResult | types.ErrorData:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             return types.ErrorData(
                 code=types.INVALID_REQUEST,
                 message=(
                     "Client declared sampling support but has no "
-                    "ANTHROPIC_API_KEY configured -- cannot fulfill this "
+                    "GROQ_API_KEY configured -- cannot fulfill this "
                     "sampling/createMessage request."
                 ),
             )
 
-        import anthropic
+        from groq import Groq
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = Groq(api_key=api_key)
 
-        anthropic_messages = [
+        # Groq's chat.completions API (OpenAI-compatible) takes the system
+        # prompt as a normal message with role="system" at the front of the
+        # list, unlike Anthropic's separate top-level `system` parameter.
+        groq_messages = []
+        if params.systemPrompt:
+            groq_messages.append({"role": "system", "content": params.systemPrompt})
+        groq_messages += [
             {
                 "role": m.role,
                 "content": m.content.text if hasattr(m.content, "text") else str(m.content),
@@ -140,15 +146,14 @@ def make_sampling_callback():
         ]
 
         print(f"\n[sampling] server asked the CLIENT's model to reason over "
-              f"{len(anthropic_messages)} message(s) ({params.maxTokens} max tokens)")
+              f"{len(groq_messages)} message(s) ({params.maxTokens} max tokens)")
 
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             max_tokens=params.maxTokens or 512,
-            system=params.systemPrompt or "",
-            messages=anthropic_messages,
+            messages=groq_messages,
         )
-        text = "".join(block.text for block in response.content if block.type == "text")
+        text = response.choices[0].message.content or ""
 
         return types.CreateMessageResult(
             role="assistant",
