@@ -4,12 +4,18 @@ Interactive IronBridge procurement agent.
 Unlike demo_scenario.py (a fixed script for repeatable grading), this
 is the genuine "someone types a request in plain English" agent: it
 discovers whatever tools/resources/prompts the MCP server currently
-exposes, hands them to Claude as real tool-use tools, and lets Claude
-decide which ones to call and with what arguments. Nothing here
-hard-codes which tool answers which question.
+exposes, hands them to Groq's model as real tool-use tools, and lets
+the model decide which ones to call and with what arguments. Nothing
+here hard-codes which tool answers which question.
+
+Uses Groq (https://console.groq.com) as the driving model -- an
+OpenAI-compatible chat API with genuine free-tier tool calling, no
+credit card required. See mcp_client.py's make_sampling_callback for
+the model that fulfils the server's own sampling/createMessage calls
+(same provider, same key).
 
 Usage:
-    export ANTHROPIC_API_KEY=...
+    export GROQ_API_KEY=...
     python3 agent/agent.py                       # stdio, spawns the server
     python3 agent/agent.py --transport http --http-url http://localhost:8080/mcp --http-token secret
 
@@ -24,39 +30,61 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
+
+from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(__file__))
 import mcp_client
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(REPO_ROOT, ".env"))  # picks up GROQ_API_KEY,
+                                                # IRONBRIDGE_MCP_URL, etc. if
+                                                # a .env file exists there;
+                                                # no-op otherwise.
+
+MODEL = "llama-3.3-70b-versatile"
+
+SYSTEM_PROMPT = (
+    "You are the IronBridge Construction procurement assistant. Use the "
+    "available tools to answer questions and carry out requests. Only "
+    "call tools that are currently offered to you -- if an action isn't "
+    "available yet (e.g. approving a request), explain to the user what "
+    "they need to do first (e.g. authenticate) rather than guessing."
+)
 
 
-def mcp_tool_to_anthropic(tool) -> dict:
+def mcp_tool_to_groq(tool) -> dict:
+    """MCP's Tool shape -> Groq/OpenAI-compatible tool-calling shape."""
     return {
-        "name": tool.name,
-        "description": tool.description or "",
-        "input_schema": tool.inputSchema,
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.inputSchema,
+        },
     }
 
 
 async def run_agent(transport: str, http_url: str | None, http_token: str | None):
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        print("ANTHROPIC_API_KEY is not set -- the agent's own driving model "
-              "(the one deciding which tools to call) needs it. Sampling "
-              "requests FROM the server would also fail without it.")
+        print("GROQ_API_KEY is not set -- the agent's own driving model "
+              "(the one deciding which tools to call) needs it. Get a free "
+              "key at https://console.groq.com -- sampling requests FROM "
+              "the server would also fail without it.")
         return
 
-    import anthropic
-    claude = anthropic.Anthropic(api_key=api_key)
+    from groq import Groq
+    groq_client = Groq(api_key=api_key)
 
-    state = {"anthropic_tools": []}
+    state = {"groq_tools": []}
 
     async def refresh_tools_and_announce():
         result = await SESSION.list_tools()
-        state["anthropic_tools"] = [mcp_tool_to_anthropic(t) for t in result.tools]
+        state["groq_tools"] = [mcp_tool_to_groq(t) for t in result.tools]
         names = [t.name for t in result.tools]
         print(f"\n[tool set updated] now available: {names}\n")
 
@@ -94,7 +122,7 @@ async def run_agent(transport: str, http_url: str | None, http_token: str | None
             "English, or 'quit' to exit.\n"
         )
 
-        conversation: list[dict] = []
+        conversation: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
         while True:
             user_text = await asyncio.to_thread(input, "you> ")
@@ -103,50 +131,56 @@ async def run_agent(transport: str, http_url: str | None, http_token: str | None
 
             conversation.append({"role": "user", "content": user_text})
 
-            # Loop until Claude stops asking for tool calls.
+            # Loop until the model stops asking for tool calls.
             while True:
-                response = claude.messages.create(
-                    model="claude-sonnet-4-5",
+                response = groq_client.chat.completions.create(
+                    model=MODEL,
                     max_tokens=1024,
-                    system=(
-                        "You are the IronBridge Construction procurement "
-                        "assistant. Use the available tools to answer "
-                        "questions and carry out requests. Only call tools "
-                        "that are currently offered to you -- if an action "
-                        "isn't available yet (e.g. approving a request), "
-                        "explain to the user what they need to do first "
-                        "(e.g. authenticate) rather than guessing."
-                    ),
-                    tools=state["anthropic_tools"],
+                    tools=state["groq_tools"],
                     messages=conversation,
                 )
 
-                conversation.append({"role": "assistant", "content": response.content})
+                message = response.choices[0].message
+                # Groq/OpenAI's assistant message must be echoed back verbatim
+                # (including tool_calls) for the follow-up call to make sense.
+                conversation.append(
+                    {
+                        "role": "assistant",
+                        "content": message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": tc.type,
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in (message.tool_calls or [])
+                        ]
+                        or None,
+                    }
+                )
 
-                if response.stop_reason != "tool_use":
-                    for block in response.content:
-                        if block.type == "text":
-                            print(f"assistant> {block.text}")
+                if not message.tool_calls:
+                    if message.content:
+                        print(f"assistant> {message.content}")
                     break
 
-                tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    print(f"  [calling tool] {block.name}({block.input})")
-                    result = await session.call_tool(block.name, block.input)
+                for tc in message.tool_calls:
+                    args = json.loads(tc.function.arguments or "{}")
+                    print(f"  [calling tool] {tc.function.name}({args})")
+                    result = await session.call_tool(tc.function.name, args)
                     text = "".join(c.text for c in result.content if hasattr(c, "text"))
                     print(f"  [tool result] {text}")
-                    tool_results.append(
+                    conversation.append(
                         {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
+                            "role": "tool",
+                            "tool_call_id": tc.id,
                             "content": text,
-                            "is_error": result.isError,
                         }
                     )
-                conversation.append({"role": "user", "content": tool_results})
-                # loop again so Claude can react to the tool result
+                # loop again so the model can react to the tool result(s)
 
 
 def main():
