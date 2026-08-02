@@ -7,8 +7,8 @@ mcp==1.28.1
 starlette>=1.3.1
 uvicorn>=0.51.0
 pydantic>=2.13.4
-anthropic>=0.120.2
 anyio>=4.14.2
+python-dotenv>=1.0.1
 
 # Optional -- only needed if IRONBRIDGE_DB_ENGINE=mssql (see .env.example
 # and db/mssql/). Also requires a system ODBC driver, not installable via pip.
