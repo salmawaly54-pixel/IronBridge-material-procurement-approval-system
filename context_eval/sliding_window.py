@@ -3,8 +3,7 @@ Strategy 1: Sliding Window.
 Keeps only the last N turns verbatim, dropping everything prior unconditionally.
 """
 
-from context_eval.transcript import Turn
-
+from transcript import Turn
 
 def apply(turns: list[Turn], window_turns: int = 10) -> list[Turn]:
     """
